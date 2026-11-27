@@ -2,18 +2,36 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from app.services import auth_service, todo_service
 
-client = TestClient(main.app)
+client = TestClient(main.app)        # sends the Authorization header once logged in
+anon_client = TestClient(main.app)   # never sends a token
+
+PASSWORD = "password123"
+
+
+def register_and_login(username: str) -> dict:
+    """Create a user, log in, and return the Authorization header."""
+    client.post("/auth/register", json={"username": username, "password": PASSWORD})
+    response = client.post("/auth/login", data={"username": username, "password": PASSWORD})
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def reset_all():
+    todo_service.todos.clear()
+    todo_service.next_id = 1
+    auth_service.users.clear()
+    auth_service.next_user_id = 1
+    client.headers.clear()
 
 
 @pytest.fixture(autouse=True)
-def reset_store():
-    """Start every test with an empty todo list."""
-    main.todos.clear()
-    main.next_id = 1
+def fresh_state():
+    """Empty stores, then log in as 'tester' for every test."""
+    reset_all()
+    client.headers.update(register_and_login("tester"))
     yield
-    main.todos.clear()
-    main.next_id = 1
+    reset_all()
 
 
 def create(title="Task", **extra):
@@ -32,6 +50,86 @@ def test_root():
 
 def test_list_empty():
     assert client.get("/todos").json() == []
+
+
+# ---------- auth ----------
+
+def test_register_returns_user_without_password():
+    response = client.post("/auth/register", json={"username": "newbie", "password": PASSWORD})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["username"] == "newbie"
+    assert "password" not in body
+    assert "password_hash" not in body
+
+
+def test_register_duplicate_username():
+    response = client.post("/auth/register", json={"username": "tester", "password": PASSWORD})
+    assert response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"username": "ab", "password": PASSWORD},         # username too short
+        {"username": "bad name!", "password": PASSWORD},  # invalid characters
+        {"username": "validuser", "password": "short"},   # password too short
+        {"username": "validuser", "password": "x" * 73},  # password too long
+    ],
+)
+def test_register_invalid(payload):
+    assert client.post("/auth/register", json=payload).status_code == 422
+
+
+def test_login_success_returns_token():
+    response = client.post("/auth/login", data={"username": "tester", "password": PASSWORD})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert body["access_token"]
+
+
+def test_login_wrong_password():
+    response = client.post("/auth/login", data={"username": "tester", "password": "wrong-pass"})
+    assert response.status_code == 401
+
+
+def test_login_unknown_user():
+    response = client.post("/auth/login", data={"username": "nobody", "password": PASSWORD})
+    assert response.status_code == 401
+
+
+def test_me_returns_current_user():
+    response = client.get("/auth/me")
+    assert response.status_code == 200
+    assert response.json()["username"] == "tester"
+
+
+def test_todos_require_token():
+    assert anon_client.get("/todos").status_code == 401
+    assert anon_client.post("/todos", json={"title": "x"}).status_code == 401
+
+
+def test_invalid_token_rejected():
+    response = anon_client.get("/todos", headers={"Authorization": "Bearer not-a-real-token"})
+    assert response.status_code == 401
+
+
+def test_users_cannot_see_each_others_todos():
+    create("tester's task")
+    client.headers.update(register_and_login("other"))
+    assert client.get("/todos").json() == []
+    assert client.get("/todos/1").status_code == 404
+    assert client.patch("/todos/1/complete").status_code == 404
+    assert client.delete("/todos/1").status_code == 404
+
+
+def test_todo_lists_are_separate():
+    create("tester task")
+    client.headers.update(register_and_login("other"))
+    create("other task")
+    titles = [t["title"] for t in client.get("/todos").json()]
+    assert titles == ["other task"]
 
 
 # ---------- create ----------
@@ -62,10 +160,10 @@ def test_ids_increase():
 @pytest.mark.parametrize(
     "payload",
     [
-        {},                                  # title missing
-        {"title": ""},                       # title empty
-        {"title": "x" * 201},                # title too long
-        {"title": "x", "priority": "urgent"},  # invalid priority
+        {},                                     # title missing
+        {"title": ""},                          # title empty
+        {"title": "x" * 201},                   # title too long
+        {"title": "x", "priority": "urgent"},   # invalid priority
     ],
 )
 def test_create_invalid(payload):
@@ -171,7 +269,6 @@ def test_filter_completed_and_priority_together():
 
 
 def test_completed_route_not_treated_as_id():
-    # /todos/completed must not be read as /todos/{todo_id}
     assert client.get("/todos/completed").status_code == 200
     assert client.get("/todos/pending").status_code == 200
 
@@ -185,6 +282,12 @@ def test_partial_update_keeps_other_fields():
     assert todo["title"] == "new"
     assert todo["description"] == "keep me"
     assert todo["priority"] == "low"
+
+
+def test_null_title_is_not_saved():
+    create("keep this title")
+    client.patch("/todos/1", json={"title": None})
+    assert client.get("/todos/1").json()["title"] == "keep this title"
 
 
 def test_update_missing_todo():
